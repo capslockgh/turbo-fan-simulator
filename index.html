@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="zh-TW" class="h-full bg-slate-950 text-slate-100 font-sans">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D 多軸渦輪扇發動機與布雷頓循環 CFD 物理模擬器 (全功能手動控制版)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #020617; font-family: 'Inter', system-ui, -apple-system, sans-serif; user-select: none; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        .ui-panel {
+            position: absolute; top: 15px; z-index: 10; width: 400px;
+            background: rgba(15, 23, 42, 0.90); backdrop-filter: blur(16px);
+            border-radius: 12px; padding: 20px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.7);
+            max-height: 96vh; overflow-y: auto;
+        }
+        .ui-panel::-webkit-scrollbar { width: 4px; }
+        .ui-panel::-webkit-scrollbar-thumb { background: #475569; border-radius: 2px; }
+        #ui-left { left: 20px; border-left: 4px solid #06b6d4; border-bottom: 1px solid rgba(6, 182, 212, 0.3); }
+        #ui-right { right: 20px; border-right: 4px solid #f97316; border-bottom: 1px solid rgba(249, 115, 22, 0.3); }
+        .neon-text-blue { text-shadow: 0 0 10px rgba(56, 189, 248, 0.8); }
+        .neon-text-red { text-shadow: 0 0 12px rgba(248, 113, 113, 0.9); }
+        .neon-text-yellow { text-shadow: 0 0 12px rgba(253, 224, 71, 0.9); }
+        input[type=range] { accent-color: #06b6d4; height: 6px; border-radius: 3px; }
+        .throttle-slider { accent-color: #f97316 !important; height: 10px; }
+        .switch { position: relative; display: inline-block; width: 44px; height: 22px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #334155; transition: .3s; border-radius: 22px; border: 1px solid #475569; }
+        .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background-color: white; transition: .3s; border-radius: 50%; }
+        input:checked + .slider { background-color: #ef4444; border-color: #b91c1c; box-shadow: 0 0 10px rgba(239, 68, 68, 0.6); }
+        input:checked + .slider:before { transform: translateX(22px); }
+        .ab-warning-flash { animation: flash 0.8s infinite alternate; }
+        @keyframes flash { from { opacity: 0.6; } to { opacity: 1; text-shadow: 0 0 15px #ef4444; } }
+        .data-box { background: rgba(15, 23, 42, 0.6); padding: 6px 10px; border-radius: 6px; border: 1px solid rgba(51, 65, 85, 0.5); }
+    </style>
+</head>
+<body class="h-full">
+
+    <script>
+        // 學術級氣動熱力學狀態
+        const state = { spools: 2, throttle: 100, n1_pct: 100, n2_pct: 100, n3_pct: 100, bpr: 5.0, mach: 0.0, alt_ft: 0, afterburner: false, forceAB: false, abLerp: 0.0, particles: true };
+        const CORE_RADIUS = 5.0; const BASE_FAN_RADIUS = 10.0;
+        const NOMINAL_N1_RPM = 3000; const NOMINAL_N2_RPM = 9000; const NOMINAL_N3_RPM = 16000;
+        
+        // 氣體與熱力學基礎常數
+        const R_GAS = 287.05; 
+        const P_STD = 101325; const T_STD = 288.15; 
+        const LHV = 42800000; 
+        const ETA_FAN = 0.89; const ETA_IPC = 0.87; const ETA_HPC = 0.85; 
+        const ETA_BURN = 0.99; const ETA_TURB = 0.92;
+        const FPR_DESIGN = 1.6; const IPPR_DESIGN = 3.5; const HPPR_DESIGN = 8.0; 
+        const MDOT_DESIGN = 420.0;
+    </script>
+
+    <!-- UI 左側 -->
+    <div id="ui-left" class="ui-panel">
+        <div class="flex justify-between items-center mb-1">
+            <h1 class="text-2xl font-black text-cyan-400 neon-text-blue tracking-wider">AERO TELEMETRY</h1>
+            <span class="px-2 py-0.5 text-[10px] font-bold rounded bg-purple-950 text-purple-300 border border-purple-500/40">V7 全功能手動版</span>
+        </div>
+        <p class="text-[11px] text-slate-400 mb-4 border-b border-slate-700/60 pb-2">ISA標準大氣 | 動態Cp/γ | MIL-E-5007D | 強制後燃開關</p>
+        
+        <div class="space-y-2">
+            <div class="bg-slate-900/90 p-3 rounded-lg border border-slate-700 relative overflow-hidden">
+                <div class="absolute left-0 top-0 bottom-0 w-1 bg-cyan-400 shadow-[0_0_10px_#06b6d4]"></div>
+                <div class="flex justify-between items-end">
+                    <div><span class="text-[10px] text-slate-400 uppercase tracking-widest block">淨推力 Net Thrust</span><span id="tel-net-thrust" class="text-3xl font-mono text-cyan-300 font-bold neon-text-blue">-- kN</span></div>
+                    <div class="text-right"><span class="text-[10px] text-slate-400 uppercase tracking-widest block">毛推力 (Gross)</span><span id="tel-gross-thrust" class="text-sm font-mono text-slate-300">-- kN</span></div>
+                </div>
+                <div class="flex justify-between items-end mt-2 pt-2 border-t border-slate-800">
+                    <div><span class="text-[10px] text-slate-400 uppercase tracking-widest block">衝壓阻力 (Ram Drag)</span><span id="tel-ram-drag" class="text-sm font-mono text-red-300">-- kN</span></div>
+                    <div class="text-right"><span class="text-[10px] text-slate-400 uppercase tracking-widest block">耗油率 TSFC</span><span id="tel-sfc" class="text-base font-mono text-yellow-400 font-bold">--</span></div>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-3 gap-1.5 mt-2">
+                <div class="data-box"><div class="text-[9px] text-slate-500 mb-0.5">靜溫 T_amb</div><div id="tel-tamb" class="text-xs font-mono">-- K</div></div>
+                <div class="data-box"><div class="text-[9px] text-slate-500 mb-0.5">總溫 T_t0 (Ram)</div><div id="tel-tt0" class="text-xs font-mono text-orange-200">-- K</div></div>
+                <div class="data-box"><div class="text-[9px] text-slate-500 mb-0.5">總壓 P_t0</div><div id="tel-pt0" class="text-xs font-mono text-cyan-200">-- kPa</div></div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-1.5">
+                <div class="data-box"><div class="text-[9px] text-slate-500 mb-0.5 flex justify-between"><span>實際流量 M_act</span><span>修正流量 M_corr</span></div>
+                    <div class="flex justify-between text-xs font-mono text-slate-200"><span id="tel-mact">--</span><span id="tel-mcorr" class="text-slate-400">-- kg/s</span></div>
+                </div>
+                <div class="data-box"><div class="text-[9px] text-slate-500 mb-0.5 flex justify-between"><span>總壓比 OPR</span><span>動態比熱比 γ_t</span></div>
+                    <div class="flex justify-between text-xs font-mono text-purple-300"><span id="tel-opr">--</span><span id="tel-gamma" class="text-slate-400">--</span></div>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-3 gap-1.5">
+                <div class="data-box"><div class="text-[9px] text-slate-500 mb-0.5">燃油流 M_f</div><div id="tel-fuel" class="text-xs font-mono text-yellow-300">-- kg/s</div></div>
+                <div class="data-box"><div class="text-[9px] text-slate-500 mb-0.5">渦輪進氣溫 TIT</div><div id="tel-tit" class="text-xs font-mono text-red-400 font-bold">-- K</div></div>
+                <div class="data-box"><div class="text-[9px] text-slate-500 mb-0.5">排氣溫 EGT</div><div id="tel-egt" class="text-xs font-mono text-orange-400">-- °C</div></div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-1.5">
+                <div class="data-box"><div class="text-[9px] text-slate-500 mb-0.5 flex justify-between"><span>核心噴流 V_c</span><span class="text-red-500">M_e</span></div>
+                    <div class="flex justify-between text-xs font-mono"><span id="tel-vc" class="text-red-300">-- m/s</span><span id="tel-mc" class="text-red-400">--</span></div>
+                </div>
+                <div class="data-box"><div class="text-[9px] text-slate-500 mb-0.5 flex justify-between"><span>外涵噴流 V_b</span><span class="text-cyan-500">M_e</span></div>
+                    <div class="flex justify-between text-xs font-mono"><span id="tel-vb" class="text-cyan-200">-- m/s</span><span id="tel-mb" class="text-cyan-400">--</span></div>
+                </div>
+            </div>
+
+            <div id="ab-status-panel" class="p-1.5 mt-1 rounded border transition-colors duration-300 border-slate-700 bg-slate-800/80 text-center">
+                <span id="ab-status-text" class="text-xs font-black text-slate-500 tracking-widest">AFTERBURNER OFF</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- UI 右側 -->
+    <div id="ui-right" class="ui-panel">
+        <h2 class="text-2xl font-black text-orange-400 mb-1 tracking-wider">FLIGHT ENVELOPE</h2>
+        <p class="text-[11px] text-slate-400 mb-3 border-b border-slate-700/60 pb-2">飛行包絡線與全手動控制系統</p>
+        <div class="space-y-3.5">
+            
+            <div class="bg-slate-900/60 p-3 rounded-lg border border-slate-700 space-y-2.5">
+                <div>
+                    <div class="flex justify-between text-[11px] font-bold mb-1"><span class="text-blue-300">飛行馬赫數 (Mach)</span><span id="mach-val" class="font-mono text-blue-100">0.00 M</span></div>
+                    <input type="range" id="mach-slider" min="0" max="2.5" step="0.01" value="0" class="w-full accent-blue-500">
+                </div>
+                <div>
+                    <div class="flex justify-between text-[11px] font-bold mb-1"><span class="text-indigo-300">飛行高度 (Altitude)</span><span id="alt-val" class="font-mono text-indigo-100">0 ft</span></div>
+                    <input type="range" id="alt-slider" min="0" max="60000" step="500" value="0" class="w-full accent-indigo-500">
+                </div>
+                <div>
+                    <div class="flex justify-between text-[11px] font-bold mb-1"><span class="text-emerald-400">設計涵道比 (BPR)</span><span id="bpr-val" class="font-mono text-emerald-200">5.0</span></div>
+                    <input type="range" id="bpr-slider" min="0.1" max="10.0" step="0.1" value="5.0" class="w-full accent-emerald-500">
+                </div>
+            </div>
+
+            <!-- 主油門與強制後燃開關 -->
+            <div class="bg-slate-900/90 p-3.5 rounded-lg border border-orange-500/40 relative overflow-hidden">
+                <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-cyan-500 via-yellow-400 to-red-600"></div>
+                <div class="flex justify-between items-end mb-1.5 mt-0.5">
+                    <div><div class="text-sm font-bold text-orange-400 neon-text-yellow">主推力油門 (Throttle)</div><div class="text-[9px] text-slate-400 uppercase tracking-wider">Target Thrust Level</div></div>
+                    <span id="throttle-val" class="font-mono text-2xl text-white font-black neon-text-yellow">100%</span>
+                </div>
+                <input type="range" id="throttle-slider" min="0" max="120" step="1" value="100" class="w-full throttle-slider">
+                
+                <!-- V7 新增：強制後燃器切換開關 (Force Afterburner Switch) -->
+                <div class="flex justify-between items-center mt-2.5 pt-2 border-t border-slate-800">
+                    <span class="text-[11px] font-bold text-red-400 uppercase tracking-wider">強制點燃後燃器 (Override AB)</span>
+                    <label class="switch">
+                        <input type="checkbox" id="ab-toggle">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- 手動 Override 轉子區塊 -->
+            <div class="bg-slate-900/60 p-2.5 rounded-lg border border-slate-700 space-y-2 relative">
+                <div class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1 pb-1 border-b border-slate-700">FADEC Manual Override (手動轉速介入)</div>
+                <div id="n1-control-box">
+                    <div class="flex justify-between text-[11px] mb-0.5"><span class="text-cyan-400 font-bold">N1 (Fan/LPC)</span><span id="n1-val-txt" class="font-mono text-cyan-200">100% (3000 RPM)</span></div>
+                    <input type="range" id="n1-slider" min="10" max="115" step="1" value="100" class="w-full accent-cyan-500">
+                </div>
+                <div id="n2-control-box">
+                    <div class="flex justify-between text-[11px] mb-0.5"><span class="text-purple-400 font-bold">N2 (Core/HPC)</span><span id="n2-val-txt" class="font-mono text-purple-200">100% (9000 RPM)</span></div>
+                    <input type="range" id="n2-slider" min="10" max="115" step="1" value="100" class="w-full accent-purple-500">
+                </div>
+                <div id="n3-control-box" style="display:none;">
+                    <div class="flex justify-between text-[11px] mb-0.5"><span class="text-pink-400 font-bold">N3 (HP)</span><span id="n3-val-txt" class="font-mono text-pink-200">100% (16000 RPM)</span></div>
+                    <input type="range" id="n3-slider" min="10" max="115" step="1" value="100" class="w-full accent-pink-500">
+                </div>
+            </div>
+
+            <!-- 架構與開關 -->
+            <div class="flex justify-between items-center gap-2">
+                <div class="flex-1 bg-slate-900 rounded p-1 flex border border-slate-700">
+                    <button id="btn-spool-2" onclick="setSpoolConfig(2)" class="flex-1 py-1 text-xs font-bold rounded bg-slate-700 text-white">2軸 (2-Spool)</button>
+                    <button id="btn-spool-3" onclick="setSpoolConfig(3)" class="flex-1 py-1 text-xs font-bold rounded text-slate-400">3軸 (3-Spool)</button>
+                </div>
+                <label class="flex items-center space-x-1 cursor-pointer bg-slate-900 p-1.5 rounded border border-slate-700">
+                    <input type="checkbox" id="particle-toggle" checked class="w-3 h-3 accent-cyan-500">
+                    <span class="text-[10px] font-bold text-slate-300">粒子</span>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <script>
+        // WebGL 初始化
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x020617);
+        scene.fog = new THREE.FogExp2(0x020617, 0.003);
+
+        const grid = new THREE.GridHelper(300, 80, 0x1e293b, 0x0f172a); grid.position.y = -22; scene.add(grid);
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(70, 25, 65);
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true; controls.dampingFactor = 0.05; controls.target.set(0, 0, -20);
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6); scene.add(ambientLight);
+        const dirLight1 = new THREE.DirectionalLight(0xe0f2fe, 1.2); dirLight1.position.set(40, 60, 30); scene.add(dirLight1);
+        const dirLight2 = new THREE.DirectionalLight(0x38bdf8, 0.5); dirLight2.position.set(-30, -20, -30); scene.add(dirLight2);
+        const engineGlow = new THREE.PointLight(0xf97316, 0, 80); engineGlow.position.set(0, 0, -55); scene.add(engineGlow);
+
+        const matTitanium = new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.85, roughness: 0.25 });
+        const matN1 = new THREE.MeshStandardMaterial({ color: 0x38bdf8, metalness: 0.7, roughness: 0.3 });
+        const matN2 = new THREE.MeshStandardMaterial({ color: 0xa855f7, metalness: 0.7, roughness: 0.3 });
+        const matN3 = new THREE.MeshStandardMaterial({ color: 0xec4899, metalness: 0.7, roughness: 0.3 });
+        const matHotSection = new THREE.MeshStandardMaterial({ color: 0xd97706, metalness: 0.6, roughness: 0.4 });
+        const matCombustor = new THREE.MeshStandardMaterial({ color: 0x991b1b, emissive: 0x450a0a, metalness: 0.5, side: THREE.DoubleSide });
+        const matAB = new THREE.MeshStandardMaterial({ color: 0x3f3f46, emissive: 0x111111, metalness: 0.8 });
+        const matCasing = new THREE.MeshStandardMaterial({ color: 0x0f172a, metalness: 0.9, roughness: 0.2, transparent: true, opacity: 0.7, side: THREE.DoubleSide });
+
+        function createStage(hubRad, bladeLen, bladeWid, bladeThick, bladeCount, material, twist = 0.3, taperRatio = 1.0) {
+            const group = new THREE.Group();
+            const hubGeo = new THREE.CylinderGeometry(hubRad, hubRad, 1.4, 32); hubGeo.rotateX(Math.PI / 2);
+            group.add(new THREE.Mesh(hubGeo, material));
+            const embed = 0.15; const actualLen = bladeLen + embed;
+            const bladeGeo = new THREE.BoxGeometry(bladeWid, actualLen, bladeThick);
+            if (taperRatio !== 1.0) {
+                const pos = bladeGeo.attributes.position;
+                for(let i=0; i<pos.count; i++) {
+                    let y = pos.getY(i); let x = pos.getX(i);
+                    let scale = (y > 0) ? taperRatio : (1.0 / taperRatio); pos.setX(i, x * scale);
+                }
+                bladeGeo.computeVertexNormals();
+            }
+            for (let i = 0; i < bladeCount; i++) {
+                const pivot = new THREE.Group(); pivot.rotation.z = (Math.PI * 2 / bladeCount) * i;
+                const blade = new THREE.Mesh(bladeGeo, material);
+                blade.position.y = hubRad + (actualLen / 2) - embed; blade.rotation.y = twist;
+                pivot.add(blade); group.add(pivot);
+            }
+            return group;
+        }
+
+        function createCutawayCasing(rIn, rOut, length, material) {
+            const shape = new THREE.Shape();
+            shape.absarc(0, 0, rOut, 0, Math.PI * 1.5, false); shape.lineTo(0, -rIn);
+            shape.absarc(0, 0, rIn, Math.PI * 1.5, 0, true); shape.lineTo(rOut, 0);
+            const geo = new THREE.ExtrudeGeometry(shape, { depth: length, bevelEnabled: false, curveSegments: 64 });
+            geo.translate(0, 0, -length / 2);
+            return new THREE.Mesh(geo, material);
+        }
+
+        const engineGroup = new THREE.Group(); scene.add(engineGroup);
+        let n1Spool = new THREE.Group(); let n2Spool = new THREE.Group(); let n3Spool = new THREE.Group(); let staticGroup = new THREE.Group();
+        engineGroup.add(n1Spool); engineGroup.add(n2Spool); engineGroup.add(n3Spool); engineGroup.add(staticGroup);
+        let vgnPetals = []; let dynamicBypassGroup = new THREE.Group(); engineGroup.add(dynamicBypassGroup);
+
+        function buildEngineMesh() {
+            while(n1Spool.children.length) n1Spool.remove(n1Spool.children[0]);
+            while(n2Spool.children.length) n2Spool.remove(n2Spool.children[0]);
+            while(n3Spool.children.length) n3Spool.remove(n3Spool.children[0]);
+            while(staticGroup.children.length) staticGroup.remove(staticGroup.children[0]);
+            while(dynamicBypassGroup.children.length) dynamicBypassGroup.remove(dynamicBypassGroup.children[0]);
+            vgnPetals = [];
+
+            const lpcStage = createStage(2.0, 2.3, 1.0, 0.1, 24, matN1, 0.3, 1.2); lpcStage.position.z = 2; n1Spool.add(lpcStage);
+
+            if (state.spools === 2) {
+                for(let i=0; i<6; i++) { let stage = createStage(2.2, 2.2-i*0.15, 0.8, 0.1, 28+i*4, matN2, 0.25, 1.15); stage.position.z = -4-(i*2.2); n2Spool.add(stage); }
+                const hpt = createStage(2.4, 2.1, 1.2, 0.2, 40, matN2, 0.35, 1.1); hpt.position.z = -27; n2Spool.add(hpt);
+                for(let i=0; i<3; i++) { let stage = createStage(2.4, 2.3+i*0.1, 1.2, 0.2, 44, matN1, 0.35, 1.1); stage.position.z = -30.5-(i*2.5); n1Spool.add(stage); }
+                const n2Shaft = new THREE.Mesh(new THREE.CylinderGeometry(1.4, 1.4, 26, 24).rotateX(Math.PI/2), matN2); n2Shaft.position.z = -15; n2Spool.add(n2Shaft);
+            } else if (state.spools === 3) {
+                for(let i=0; i<3; i++) { let stage = createStage(2.2, 2.2-i*0.1, 0.8, 0.1, 28+i*4, matN2, 0.25, 1.15); stage.position.z = -4-(i*2.2); n2Spool.add(stage); }
+                for(let i=3; i<6; i++) { let stage = createStage(2.3, 2.2-i*0.15, 0.8, 0.1, 36+i*4, matN3, 0.25, 1.15); stage.position.z = -4-(i*2.2); n3Spool.add(stage); }
+                const hpt = createStage(2.4, 2.0, 1.1, 0.2, 40, matN3, 0.35, 1.1); hpt.position.z = -27; n3Spool.add(hpt);
+                const ipt = createStage(2.4, 2.2, 1.1, 0.2, 42, matN2, 0.35, 1.1); ipt.position.z = -29.5; n2Spool.add(ipt);
+                for(let i=0; i<2; i++) { let stage = createStage(2.4, 2.4+i*0.1, 1.2, 0.2, 46, matN1, 0.35, 1.1); stage.position.z = -32.5-(i*2.5); n1Spool.add(stage); }
+                const n2Shaft = new THREE.Mesh(new THREE.CylinderGeometry(1.4, 1.4, 26, 24).rotateX(Math.PI/2), matN2); n2Shaft.position.z = -15; n2Spool.add(n2Shaft);
+                const n3Shaft = new THREE.Mesh(new THREE.CylinderGeometry(1.9, 1.9, 14, 24).rotateX(Math.PI/2), matN3); n3Shaft.position.z = -18; n3Spool.add(n3Shaft);
+            }
+
+            const combustor = createCutawayCasing(CORE_RADIUS - 0.1, CORE_RADIUS + 0.1, 7, matCombustor); combustor.position.z = -20.5; staticGroup.add(combustor);
+            const coreCasing = createCutawayCasing(CORE_RADIUS + 0.1, CORE_RADIUS + 0.3, 45, matCasing); coreCasing.position.z = -18; staticGroup.add(coreCasing);
+            const n1Shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 0.7, 52, 24).rotateX(Math.PI/2), matN1); n1Shaft.position.z = -14; n1Spool.add(n1Shaft);
+
+            const abGroup = new THREE.Group(); abGroup.position.z = -42; staticGroup.add(abGroup);
+            for(let r=2; r<=4; r+=1.5) { abGroup.add(new THREE.Mesh(new THREE.CylinderGeometry(r, r-0.2, 0.4, 32, 1, true, 0, Math.PI*2).rotateX(Math.PI/2), matAB)); }
+
+            const vgnGroup = new THREE.Group(); vgnGroup.position.z = -46; staticGroup.add(vgnGroup);
+            const petalGeo = new THREE.BoxGeometry(1.4, 0.15, 11); petalGeo.translate(0, 0, -5.5);
+            for(let i=0; i<32; i++) {
+                if (i >= 23 && i <= 31) continue;
+                const pivot = new THREE.Group(); pivot.rotation.z = (i / 32) * Math.PI * 2;
+                const petal = new THREE.Mesh(petalGeo, matTitanium); petal.position.y = CORE_RADIUS; petal.rotation.x = 0.15;
+                pivot.add(petal); vgnGroup.add(pivot); vgnPetals.push(petal);
+            }
+
+            const fanStage = createStage(1.8, BASE_FAN_RADIUS - 1.8, 1.6, 0.25, 22, matTitanium, 0.6, 2.0); fanStage.position.z = 10; dynamicBypassGroup.add(fanStage);
+            const spinner = new THREE.Mesh(new THREE.CylinderGeometry(0.01, 1.8, 6, 32).rotateX(Math.PI/2), matTitanium); spinner.position.z = 13; dynamicBypassGroup.add(spinner);
+            const bypassCasing = createCutawayCasing(BASE_FAN_RADIUS, BASE_FAN_RADIUS + 0.5, 36, matCasing); bypassCasing.position.z = -6; dynamicBypassGroup.add(bypassCasing);
+        }
+
+        // CFD 粒子流場
+        const pCount = 3200; const pGeo = new THREE.SphereGeometry(0.2, 4, 4); const pMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+        const particles = new THREE.InstancedMesh(pGeo, pMat, pCount); scene.add(particles);
+        const pData = []; const dummy = new THREE.Object3D();
+        const colBlue = new THREE.Color(0x38bdf8); const colOrange = new THREE.Color(0xf97316); const colAB = new THREE.Color(0xffffff); const colTemp = new THREE.Color();
+        
+        function getDynamicFanRadius() { return Math.max(CORE_RADIUS + 0.5, CORE_RADIUS * Math.sqrt(1 + state.bpr)); }
+        function resetParticle(index, randomZ = false) {
+            const fanR = getDynamicFanRadius(); const r = Math.sqrt(Math.random()) * fanR; const theta = Math.random() * Math.PI * 2;
+            pData[index] = { r: r, theta: theta, z: randomZ ? (15 - Math.random() * 90) : 15 + Math.random() * 2, speed: 0.6 + Math.random() * 0.4, isCore: r < CORE_RADIUS };
+            updateParticleMatrix(index);
+        }
+        function updateParticleMatrix(i) {
+            const d = pData[i]; dummy.position.set(Math.cos(d.theta) * d.r, Math.sin(d.theta) * d.r, d.z);
+            dummy.updateMatrix(); particles.setMatrixAt(i, dummy.matrix);
+        }
+        for (let i = 0; i < pCount; i++) resetParticle(i, true);
+
+        function updateSpoolUI() {
+            document.getElementById('n1-val-txt').textContent = Math.round(state.n1_pct) + '% (' + Math.round((state.n1_pct/100)*NOMINAL_N1_RPM) + ' RPM)';
+            document.getElementById('n2-val-txt').textContent = Math.round(state.n2_pct) + '% (' + Math.round((state.n2_pct/100)*NOMINAL_N2_RPM) + ' RPM)';
+            document.getElementById('n3-val-txt').textContent = Math.round(state.n3_pct) + '% (' + Math.round((state.n3_pct/100)*NOMINAL_N3_RPM) + ' RPM)';
+            
+            document.getElementById('n1-slider').value = state.n1_pct;
+            document.getElementById('n2-slider').value = state.n2_pct;
+            document.getElementById('n3-slider').value = state.n3_pct;
+        }
+
+        function setSpoolConfig(num) {
+            state.spools = num;
+            document.getElementById('btn-spool-2').className = num===2 ? "flex-1 py-1 text-xs font-bold rounded bg-slate-700 text-white" : "flex-1 py-1 text-xs font-bold rounded text-slate-400";
+            document.getElementById('btn-spool-3').className = num===3 ? "flex-1 py-1 text-xs font-bold rounded bg-slate-700 text-white" : "flex-1 py-1 text-xs font-bold rounded text-slate-400";
+            document.getElementById('n3-control-box').style.display = num===3 ? "block" : "none";
+            buildEngineMesh();
+        }
+
+        // V7 狀態更新邏輯：包含 Force AB 判定
+        function updateEngineState() {
+            // 油門驅動的預設後燃器觸發 (油門 > 100%)
+            const autoAB = state.throttle > 100;
+            state.afterburner = autoAB || state.forceAB;
+
+            const abStatusText = document.getElementById('ab-status-text');
+            const abPanel = document.getElementById('ab-status-panel');
+            if (state.afterburner) {
+                abStatusText.textContent = state.forceAB ? "AFTERBURNER ENGAGED (FORCED)" : "AFTERBURNER ENGAGED (MAX POWER)";
+                abStatusText.className = "text-xs font-black text-red-400 tracking-widest ab-warning-flash";
+                abPanel.className = "p-1.5 mt-1 rounded border transition-colors duration-300 border-red-500 bg-red-950/60 text-center";
+            } else {
+                abStatusText.textContent = "AFTERBURNER OFF";
+                abStatusText.className = "text-xs font-black text-slate-500 tracking-widest";
+                abPanel.className = "p-1.5 mt-1 rounded border transition-colors duration-300 border-slate-700 bg-slate-800/80 text-center";
+            }
+        }
+
+        function updateFADEC(t) {
+            let n1 = t <= 50 ? (20 + (t/50)*40) : (t <= 100 ? 60 + ((t-50)/50)*40 : 100 + ((t-100)/20)*10);
+            let n2 = t <= 50 ? (45 + (t/50)*40) : (t <= 100 ? 85 + ((t-50)/50)*15 : 100 + ((t-100)/20)*5);
+            let n3 = t <= 50 ? (50 + (t/50)*38) : (t <= 100 ? 88 + ((t-50)/50)*12 : 100 + ((t-100)/20)*4);
+            state.n1_pct = n1; state.n2_pct = n2; state.n3_pct = n3;
+            
+            updateSpoolUI();
+            updateEngineState();
+        }
+
+        // 綁定主油門
+        document.getElementById('throttle-slider').addEventListener('input', (e) => {
+            state.throttle = parseFloat(e.target.value); 
+            let valDOM = document.getElementById('throttle-val'); valDOM.textContent = Math.round(state.throttle) + '%';
+            if(state.throttle > 100) valDOM.className = "font-mono text-2xl font-black text-red-400 neon-text-red";
+            else valDOM.className = "font-mono text-2xl text-white font-black neon-text-yellow";
+            updateFADEC(state.throttle);
+        });
+
+        // V7 新增：強制點燃後燃器切換鈕
+        document.getElementById('ab-toggle').addEventListener('change', (e) => {
+            state.forceAB = e.target.checked;
+            updateEngineState();
+        });
+
+        // 綁定 Override 手動轉速拉桿
+        document.getElementById('n1-slider').addEventListener('input', (e) => { state.n1_pct = parseFloat(e.target.value); updateSpoolUI(); });
+        document.getElementById('n2-slider').addEventListener('input', (e) => { state.n2_pct = parseFloat(e.target.value); updateSpoolUI(); });
+        document.getElementById('n3-slider').addEventListener('input', (e) => { state.n3_pct = parseFloat(e.target.value); updateSpoolUI(); });
+
+        document.getElementById('mach-slider').addEventListener('input', (e) => { state.mach = parseFloat(e.target.value); document.getElementById('mach-val').textContent = state.mach.toFixed(2) + ' M'; });
+        document.getElementById('alt-slider').addEventListener('input', (e) => { state.alt_ft = parseFloat(e.target.value); document.getElementById('alt-val').textContent = state.alt_ft + ' ft'; });
+        document.getElementById('bpr-slider').addEventListener('input', (e) => { state.bpr = parseFloat(e.target.value); document.getElementById('bpr-val').textContent = state.bpr.toFixed(1); });
+        document.getElementById('particle-toggle').addEventListener('change', (e) => { state.particles = e.target.checked; particles.visible = state.particles; });
+        window.addEventListener('resize', () => { camera.aspect = window.innerWidth/window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
+
+        buildEngineMesh(); updateFADEC(state.throttle);
+
+        // ==== 學術級熱力學運算函式 ====
+        function getCp(T, f = 0) {
+            let T_shift = Math.max(0, T - 300);
+            return 1005 + T_shift * 0.15 + (T_shift * T_shift) * 0.00008 + f * 4000;
+        }
+        function getGamma(cp) { return cp / (cp - R_GAS); }
+
+        function solveCompressor(T_in, PR, eta) {
+            let T_out = T_in * Math.pow(PR, 0.286);
+            for(let i=0; i<3; i++) {
+                let cp_avg = getCp((T_in + T_out)/2); let gam = getGamma(cp_avg);
+                T_out = T_in * (1 + (Math.pow(PR, (gam-1)/gam) - 1) / eta);
+            }
+            return T_out;
+        }
+
+        function solveNozzle(Pt, Tt, Pamb, f_total) {
+            let cp = getCp(Tt, f_total); let gam = getGamma(cp);
+            let PR_crit = Math.pow((gam + 1)/2, gam / (gam - 1));
+            let V = 0, M_e = 0, T_exit = Tt;
+            if (Pt > Pamb) {
+                let NPR = Pt / Pamb;
+                if (NPR <= PR_crit) {
+                    M_e = Math.sqrt( (2/(gam-1)) * (Math.pow(NPR, (gam-1)/gam) - 1) );
+                    T_exit = Tt / (1 + 0.5*(gam-1)*M_e*M_e);
+                    V = M_e * Math.sqrt(gam * R_GAS * T_exit);
+                } else {
+                    M_e = Math.sqrt( (2/(gam-1)) * (Math.pow(NPR, (gam-1)/gam) - 1) );
+                    T_exit = Tt / Math.pow(NPR, (gam-1)/gam);
+                    V = M_e * Math.sqrt(gam * R_GAS * T_exit);
+                }
+            }
+            return { V, M_e, T_exit, gam, cp };
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            state.abLerp = THREE.MathUtils.lerp(state.abLerp, state.afterburner ? 1.0 : 0.0, 0.08);
+            const fanR = getDynamicFanRadius(); const scale = fanR / BASE_FAN_RADIUS; dynamicBypassGroup.scale.set(scale, scale, 1);
+            vgnPetals.forEach(petal => petal.rotation.x = THREE.MathUtils.lerp(0.15, -0.12, state.abLerp));
+            engineGlow.intensity = state.abLerp * 220; matAB.emissiveIntensity = state.abLerp * 3.5;
+
+            // 熱力學循環
+            const h_m = state.alt_ft * 0.3048;
+            const T_amb = h_m <= 11000 ? 288.15 - 0.0065 * h_m : 216.65;
+            const P_amb = h_m <= 11000 ? 101325 * Math.pow(T_amb/288.15, 5.2561) : 22632 * Math.exp(-0.000157 * (h_m - 11000));
+            const rho_amb = P_amb / (R_GAS * T_amb);
+
+            const M0 = state.mach;
+            const cp_amb = getCp(T_amb); const gam_amb = getGamma(cp_amb);
+            const T_t0 = T_amb * (1 + 0.5 * (gam_amb - 1) * M0 * M0);
+            let eta_ram = 1.0; if (M0 > 1.0) eta_ram = 1.0 - 0.075 * Math.pow(M0 - 1.0, 1.35);
+            const P_t0 = P_amb * Math.pow(1 + 0.5 * (gam_amb - 1) * M0 * M0, gam_amb / (gam_amb - 1)) * eta_ram;
+            const V0 = M0 * Math.sqrt(gam_amb * R_GAS * T_amb);
+
+            const n1_f = Math.max(0.01, state.n1_pct / 100); const n2_f = Math.max(0.01, state.n2_pct / 100); const n3_f = Math.max(0.01, state.n3_pct / 100);
+            const area_scale = (1 + state.bpr) / 6.0;
+            const m_dot_corr = MDOT_DESIGN * n1_f * area_scale;
+            const m_dot_act = m_dot_corr * (P_t0 / P_STD) / Math.sqrt(T_t0 / T_STD);
+            const m_dot_core = m_dot_act / (1 + state.bpr); const m_dot_bypass = m_dot_act - m_dot_core;
+
+            const FPR = 1 + (FPR_DESIGN - 1) * Math.pow(n1_f, 2); 
+            let IPPR = 1.0; let HPPR = 1.0;
+            if (state.spools === 2) { HPPR = 1 + (HPPR_DESIGN * IPPR_DESIGN - 1) * Math.pow(n2_f, 2); }
+            else if (state.spools === 3) { IPPR = 1 + (IPPR_DESIGN - 1) * Math.pow(n2_f, 2); HPPR = 1 + (HPPR_DESIGN - 1) * Math.pow(n3_f, 2); }
+            const OPR = FPR * IPPR * HPPR;
+
+            const T_t21 = solveCompressor(T_t0, FPR, ETA_FAN);
+            const T_t24 = solveCompressor(T_t21, IPPR, ETA_IPC);
+            const T_t3  = solveCompressor(T_t24, HPPR, ETA_HPC);
+
+            const W_fan = m_dot_act * getCp((T_t0+T_t21)/2) * (T_t21 - T_t0);
+            const W_ipc = m_dot_core * getCp((T_t21+T_t24)/2) * (T_t24 - T_t21);
+            const W_hpc = m_dot_core * getCp((T_t24+T_t3)/2) * (T_t3 - T_t24);
+            const W_comp_total = W_fan + W_ipc + W_hpc;
+
+            let target_TIT = 900 + (state.throttle / 100) * 800;
+            const min_TIT = T_t3 + (W_comp_total / (m_dot_core * getCp(1300, 0.02))) + 30; 
+            const TIT = Math.max(target_TIT, min_TIT);
+
+            let f = 0.02;
+            for(let i=0; i<3; i++) {
+                let cp_comb = getCp((T_t3 + TIT)/2, f);
+                f = (cp_comb * TIT - getCp(T_t3)*T_t3) / (LHV * ETA_BURN - cp_comb * TIT);
+            }
+            if (f < 0) f = 0; const m_dot_fuel = m_dot_core * f;
+
+            let T_t5 = TIT - W_comp_total / ((m_dot_core + m_dot_fuel) * getCp((TIT + 1200)/2, f));
+            for(let i=0; i<3; i++) { T_t5 = TIT - W_comp_total / ((m_dot_core + m_dot_fuel) * getCp((TIT + T_t5)/2, f)); }
+            
+            let cp_turb = getCp((TIT + T_t5)/2, f); let gam_turb = getGamma(cp_turb);
+            let T_t5_iso = TIT - (TIT - T_t5)/ETA_TURB;
+            let PR_turb = Math.pow(TIT / T_t5_iso, gam_turb / (gam_turb - 1));
+            let P_t5 = (P_t0 * OPR * 0.96) / PR_turb;
+
+            let f_ab = 0; let m_dot_ab = 0;
+            if (state.abLerp > 0.01) {
+                f_ab = state.abLerp * 0.045; m_dot_ab = m_dot_core * f_ab;
+                let cp_ab = getCp((T_t5 + 2100)/2, f + f_ab);
+                T_t5 = ((m_dot_core + m_dot_fuel)*getCp(T_t5, f)*T_t5 + m_dot_ab*LHV*ETA_BURN) / ((m_dot_core + m_dot_fuel + m_dot_ab)*cp_ab);
+                P_t5 *= (1 - 0.05 * state.abLerp);
+            }
+
+            const core = solveNozzle(P_t5, T_t5, P_amb, f + f_ab);
+            const P_t21 = P_t0 * FPR * 0.98;
+            const bypass = solveNozzle(P_t21, T_t21, P_amb, 0);
+
+            const m_dot_core_exit = m_dot_core + m_dot_fuel + m_dot_ab;
+            const gross_thrust = m_dot_core_exit * core.V + m_dot_bypass * bypass.V;
+            const ram_drag = m_dot_act * V0;
+            let net_thrust_N = gross_thrust - ram_drag; if (net_thrust_N < 0) net_thrust_N = 0;
+            const TSFC = (net_thrust_N > 100) ? ((m_dot_fuel + m_dot_ab) / (net_thrust_N / 1000)) * 3600 : 0;
+
+            document.getElementById('tel-net-thrust').textContent = (net_thrust_N/1000).toFixed(1) + ' kN';
+            document.getElementById('tel-gross-thrust').textContent = (gross_thrust/1000).toFixed(1) + ' kN';
+            document.getElementById('tel-ram-drag').textContent = (ram_drag/1000).toFixed(1) + ' kN';
+            document.getElementById('tel-sfc').textContent = TSFC.toFixed(2) + ' kg/kNh';
+            
+            document.getElementById('tel-tamb').textContent = Math.round(T_amb) + ' K';
+            document.getElementById('tel-tt0').textContent = Math.round(T_t0) + ' K';
+            document.getElementById('tel-pt0').textContent = (P_t0/1000).toFixed(1) + ' kPa';
+            
+            document.getElementById('tel-mact').textContent = m_dot_act.toFixed(1);
+            document.getElementById('tel-mcorr').textContent = m_dot_corr.toFixed(1) + ' kg/s';
+            document.getElementById('tel-opr').textContent = OPR.toFixed(1) + ' : 1';
+            document.getElementById('tel-gamma').textContent = gam_turb.toFixed(3);
+            
+            document.getElementById('tel-fuel').textContent = (m_dot_fuel + m_dot_ab).toFixed(2) + ' kg/s';
+            document.getElementById('tel-tit').textContent = Math.round(TIT) + ' K';
+            document.getElementById('tel-egt').textContent = Math.round(T_t5 - 273.15) + ' °C';
+            
+            document.getElementById('tel-vc').textContent = Math.round(core.V) + ' m/s';
+            document.getElementById('tel-mc').textContent = core.M_e.toFixed(2) + ' M';
+            document.getElementById('tel-vb').textContent = Math.round(bypass.V) + ' m/s';
+            document.getElementById('tel-mb').textContent = bypass.M_e.toFixed(2) + ' M';
+
+            const n1Rad = n1_f * NOMINAL_N1_RPM * 0.000035; const n2Rad = n2_f * NOMINAL_N2_RPM * 0.000035; const n3Rad = n3_f * NOMINAL_N3_RPM * 0.000035;
+            n1Spool.rotation.z -= n1Rad; n2Spool.rotation.z -= n2Rad; n3Spool.rotation.z -= n3Rad; dynamicBypassGroup.children[0].rotation.z -= n1Rad;
+
+            if (state.particles) {
+                const coreSpeedBase = 0.12 + (core.V / 1800); const bypassSpeedBase = 0.12 + (bypass.V / 1000);
+                for (let i = 0; i < pCount; i++) {
+                    const d = pData[i]; let pSpeed = d.isCore ? (d.speed * coreSpeedBase) : (d.speed * bypassSpeedBase);
+                    if (d.isCore) {
+                        if (d.z > -18) particles.setColorAt(i, colBlue);
+                        else if (d.z <= -18 && d.z > -42) { particles.setColorAt(i, colOrange); pSpeed *= 1.35; }
+                        else {
+                            if (state.abLerp > 0.05) { colTemp.lerpColors(colOrange, colAB, state.abLerp); particles.setColorAt(i, colTemp); d.r += 0.04 * state.abLerp; pSpeed *= (1 + 2.2 * state.abLerp); }
+                            else { particles.setColorAt(i, colOrange); if(d.r > 1.5) d.r -= 0.02; }
+                        }
+                    } else { particles.setColorAt(i, colBlue); if (d.r > fanR) d.r = fanR - 0.2; }
+                    d.z -= pSpeed * (5.0 + M0*2);
+                    if (d.z < -85) resetParticle(i, false); else updateParticleMatrix(i);
+                }
+                particles.instanceMatrix.needsUpdate = true; if (particles.instanceColor) particles.instanceColor.needsUpdate = true;
+            }
+            controls.update(); renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>
